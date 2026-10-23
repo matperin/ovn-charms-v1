@@ -313,6 +313,27 @@ options:
       NOTE: It is recommended to avoid overlap between datapath (pmd-cpu-mask)
       and non-datapath (dpdk-lcore-mask) cpus. The charm will go into blocked
       state if an overlap is detected.
+  ovs-cpu-affinity:
+    type: string
+    default:
+    description: |
+      Comma separated list of CPUs to pin the ovs-vswitchd process to, in the
+      format accepted by the systemd CPUAffinity= setting. Ranges are
+      supported.
+
+      Example: 136-143,392-399
+
+      This is useful on hyperconverged hosts to keep Open vSwitch on the NUMA
+      node local to the network adapters and away from the CPUs used by
+      other workloads, such as Ceph OSDs.
+
+      When DPDK is enabled, include the CPUs in pmd-cpu-set as well, as
+      ovs-vswitchd cannot run PMD threads on CPUs outside of this set.
+
+      When unset, ovs-vswitchd may run on any CPU.
+
+      NOTE: Changing this value will restart openvswitch-switch, resulting in
+      an expected data plane outage while the service restarts.
   sriov-device-mappings:
     type: string
     default:

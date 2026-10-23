@@ -75,6 +75,10 @@ DOCA_HOST_DEB = '/tmp/doca-host.deb'
 # packages and the offload provider are then not ours to manage.
 DOCA_MANAGED_FLAG = 'charm.ovn.doca-managed'
 
+# systemd drop-in pinning ``ovs-vswitchd`` to the CPUs in ``ovs-cpu-affinity``.
+OVS_VSWITCHD_CPU_AFFINITY_DROP_IN = (
+    '/etc/systemd/system/ovs-vswitchd.service.d/charm-cpu-affinity.conf')
+
 _DEFERABLE_SVC_LIST = ['openvswitch-switch', 'ovn-controller', 'ovn-host',
                        'ovs-vswitchd', 'ovsdb-server', 'ovs-record-hostname']
 
@@ -1380,6 +1384,35 @@ class BaseOVNChassisCharm(charms_openstack.charm.OpenStackCharm):
             reactive.clear_flag(DOCA_MANAGED_FLAG)
         return something_changed
 
+    def configure_ovs_cpu_affinity(self):
+        """Pin ``ovs-vswitchd`` to the CPUs in ``ovs-cpu-affinity``.
+
+        systemd applies ``CPUAffinity`` when it starts the service, so a
+        change only takes effect once ``ovs-vswitchd`` is restarted.
+
+        :returns: Whether something changed
+        :rtype: bool
+        """
+        drop_in = OVS_VSWITCHD_CPU_AFFINITY_DROP_IN
+        if self.options.ovs_cpu_affinity:
+            content = '[Service]\nCPUAffinity={}\n'.format(
+                self.options.ovs_cpu_affinity)
+            try:
+                with open(drop_in) as f:
+                    if f.read() == content:
+                        return False
+            except FileNotFoundError:
+                pass
+            os.makedirs(os.path.dirname(drop_in), exist_ok=True)
+            with open(drop_in, 'w') as f:
+                f.write(content)
+        elif os.path.exists(drop_in):
+            os.remove(drop_in)
+        else:
+            return False
+        self.run('systemctl', 'daemon-reload')
+        return True
+
     def configure_ovs_datapath(self):
         """Configure the datapath type defaults in Open vSwitch.
 
@@ -1494,7 +1527,8 @@ class BaseOVNChassisCharm(charms_openstack.charm.OpenStackCharm):
                          '@manager')
 
         restart_required = (
-            self.configure_ovs_hw_offload() | self.configure_ovs_dpdk())
+            self.configure_ovs_hw_offload() | self.configure_ovs_dpdk() |
+            self.configure_ovs_cpu_affinity())
         if restart_required:
             ch_core.host.service_restart('openvswitch-switch')
 

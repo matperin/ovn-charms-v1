@@ -15,8 +15,10 @@
 import collections
 import copy
 import io
+import os
 import textwrap
 import subprocess
+import tempfile
 import unittest.mock as mock
 import uuid
 
@@ -522,6 +524,12 @@ class Helper(test_utils.PatchHelper):
             },
             'driver': 'fakedriver',
         }
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.cpu_affinity_drop_in = os.path.join(
+            tmpdir.name, 'ovs-vswitchd.service.d', 'charm-cpu-affinity.conf')
+        self.patch_object(ovn_charm, 'OVS_VSWITCHD_CPU_AFFINITY_DROP_IN',
+                          new=self.cpu_affinity_drop_in)
         self.patch_object(ovn_charm.ch_core.hookenv, 'config')
 
         def _fake_config(x=None):
@@ -1171,6 +1179,7 @@ class TestOVNChassisCharm(Helper):
             'ovn-source': 'distro',
             'ovs-exporter-channel': '',
             'enable-version-pinning': False,
+            'ovs-cpu-affinity': None,
             'pmd-cpu-set': None,
         }
         super().setUp(config=self.local_config)
@@ -1233,6 +1242,62 @@ class TestOVNChassisCharm(Helper):
         self.SimpleOVSDB.return_value = ovsdb
         self.target.configure_ovs_doca()
         self.clear_flag.assert_called_once_with('charm.ovn.doca-managed')
+
+    def patch_cpu_affinity_drop_in(self, ovs_cpu_affinity):
+        """Configure ``ovs-cpu-affinity`` and return the drop-in path.
+
+        :param ovs_cpu_affinity: Value for the ``ovs-cpu-affinity`` option.
+        :type ovs_cpu_affinity: Optional[str]
+        :returns: Path to the drop-in.
+        :rtype: str
+        """
+        self.local_config.update({'ovs-cpu-affinity': ovs_cpu_affinity})
+        self.target = ovn_charm.BaseOVNChassisCharm()
+        self.patch_target('run')
+        return self.cpu_affinity_drop_in
+
+    def test_configure_ovs_cpu_affinity_writes_drop_in(self):
+        drop_in = self.patch_cpu_affinity_drop_in('136-143,392-399')
+        self.assertTrue(self.target.configure_ovs_cpu_affinity())
+        with open(drop_in) as f:
+            self.assertEqual(
+                f.read(), '[Service]\nCPUAffinity=136-143,392-399\n')
+        self.run.assert_called_once_with('systemctl', 'daemon-reload')
+
+    def test_configure_ovs_cpu_affinity_unchanged(self):
+        drop_in = self.patch_cpu_affinity_drop_in('136-143,392-399')
+        os.makedirs(os.path.dirname(drop_in))
+        with open(drop_in, 'w') as f:
+            f.write('[Service]\nCPUAffinity=136-143,392-399\n')
+        self.assertFalse(self.target.configure_ovs_cpu_affinity())
+        self.run.assert_not_called()
+
+    def test_configure_ovs_cpu_affinity_unset_removes_drop_in(self):
+        drop_in = self.patch_cpu_affinity_drop_in(None)
+        os.makedirs(os.path.dirname(drop_in))
+        with open(drop_in, 'w') as f:
+            f.write('[Service]\nCPUAffinity=136-143,392-399\n')
+        self.assertTrue(self.target.configure_ovs_cpu_affinity())
+        self.assertFalse(os.path.exists(drop_in))
+        self.run.assert_called_once_with('systemctl', 'daemon-reload')
+
+    def test_configure_ovs_cpu_affinity_unset_without_drop_in(self):
+        self.patch_cpu_affinity_drop_in(None)
+        self.assertFalse(self.target.configure_ovs_cpu_affinity())
+        self.run.assert_not_called()
+
+    def test_configure_ovs_restarts_on_cpu_affinity_change(self):
+        self.patch_target('configure_ovs_cpu_affinity', return_value=True)
+        self.patch_target('run')
+        self.patch_target('check_if_paused', return_value=(None, None))
+        self.patch_target('get_data_ip')
+        self.patch_target('get_ovs_hostname')
+        self.patch_object(ovn_charm.OVNConfigurationAdapter, 'ovn_key')
+        self.patch_object(ovn_charm.OVNConfigurationAdapter, 'ovn_cert')
+        self.patch_object(ovn_charm.OVNConfigurationAdapter, 'ovn_ca_cert')
+        self.patch_object(ovn_charm.ch_core.host, 'service_restart')
+        self.target.configure_ovs('fake-sb-conn-str', False)
+        self.service_restart.assert_called_once_with('openvswitch-switch')
 
     def test_purge_packages_doca_not_ours(self):
         self.patch_object(ovn_charm.reactive, 'is_flag_set',
@@ -2092,6 +2157,7 @@ class TestDOCAOVNChassisCharm(Helper):
             'enable-version-pinning': False,
             'vpd-device-spec': '',
             'ovn-source': 'distro',
+            'ovs-cpu-affinity': None,
             'pmd-cpu-set': None,
         })
 
