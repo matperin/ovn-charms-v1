@@ -34,6 +34,7 @@ import charmhelpers.fetch as ch_fetch
 import charms_openstack.adapters
 import charms_openstack.charm
 
+import charms.epa_client as epa_client
 from charms.layer import snap
 
 
@@ -74,6 +75,21 @@ DOCA_HOST_DEB = '/tmp/doca-host.deb'
 # arrive with OVS-DOCA already installed and configured by its image, and the
 # packages and the offload provider are then not ours to manage.
 DOCA_MANAGED_FLAG = 'charm.ovn.doca-managed'
+
+# Where the kernel exposes network devices, PCI devices and NUMA nodes.
+SYSFS_NET = '/sys/class/net'
+SYSFS_PCI = '/sys/bus/pci/devices'
+SYSFS_NUMA = '/sys/devices/system/node'
+
+# systemd drop-in pinning ``ovs-vswitchd`` to the CPUs the EPA orchestrator
+# holds for it.
+OVS_VSWITCHD_CPU_AFFINITY_DROP_IN = (
+    '/etc/systemd/system/ovs-vswitchd.service.d/charm-cpu-affinity.conf')
+
+# Name the CPUs of ``ovs-vswitchd`` are held under in the EPA orchestrator,
+# and the flag set while it may hold some.
+EPA_SERVICE_NAME = 'ovs-vswitchd'
+EPA_CORES_HELD_FLAG = 'charm.ovn.epa-cores-held'
 
 _DEFERABLE_SVC_LIST = ['openvswitch-switch', 'ovn-controller', 'ovn-host',
                        'ovs-vswitchd', 'ovsdb-server', 'ovs-record-hostname']
@@ -150,6 +166,58 @@ def ifdata_for_rxq(ifdata, n_rxq):
         **ifdata,
         'options': {**ifdata.get('options', {}), 'n_rxq': n_rxq},
     }
+
+
+def _read_numa_node(path):
+    """Read a ``numa_node`` sysfs attribute.
+
+    :param path: Path to the attribute.
+    :type path: str
+    :returns: The NUMA node, or nothing when there is none.
+    :rtype: Set[int]
+    """
+    try:
+        with open(path) as f:
+            numa_node = int(f.read())
+    except (OSError, ValueError):
+        return set()
+    # The kernel reports -1 for a device not attached to a NUMA node.
+    return {numa_node} if numa_node >= 0 else set()
+
+
+def interface_numa_nodes(ifname, ifdata):
+    """NUMA nodes of the devices behind an Open vSwitch interface.
+
+    :param ifname: Interface name
+    :type ifname: str
+    :param ifdata: Interface data as resolved by ``BridgePortInterfaceMap``
+    :type ifdata: Dict[str,any]
+    :returns: NUMA nodes
+    :rtype: Set[int]
+    """
+    pci_address = ifdata.get('options', {}).get('dpdk-devargs')
+    if pci_address:
+        # A port bound to a DPDK driver has no network device left.
+        return _read_numa_node(
+            os.path.join(SYSFS_PCI, pci_address, 'numa_node'))
+    netdev = os.path.join(SYSFS_NET, ifname)
+    numa_nodes = _read_numa_node(os.path.join(netdev, 'device', 'numa_node'))
+    # A bond or VLAN has no device of its own, the devices it is stacked on
+    # do.
+    for lower in glob.glob(os.path.join(netdev, 'lower_*')):
+        numa_nodes |= interface_numa_nodes(
+            os.path.basename(lower)[len('lower_'):], {})
+    return numa_nodes
+
+
+def host_numa_nodes():
+    """NUMA nodes of this host.
+
+    :rtype: List[int]
+    """
+    return sorted(int(name[len('node'):])
+                  for name in os.listdir(SYSFS_NUMA)
+                  if re.match(r'node\d+$', name))
 
 
 class DeferredEventMixin():
@@ -1041,6 +1109,15 @@ class BaseOVNChassisCharm(charms_openstack.charm.OpenStackCharm):
                         'resume the unit to apply the change.'
                         .format(DATAPATH_TYPE_DOCA))
 
+        if (self.options.ovs_cpu_cores and
+                not os.path.exists(OVS_VSWITCHD_CPU_AFFINITY_DROP_IN)):
+            # Pinning is best effort, so the unit keeps working, but says
+            # so.  The reason is in the log of the hook that tried.
+            return ('active',
+                    'ovs-vswitchd is not pinned to the {} CPUs in '
+                    'ovs-cpu-cores, see the unit log.'
+                    .format(self.options.ovs_cpu_cores))
+
         return None, None
 
     def states_to_check(self, required_relations=None):
@@ -1380,6 +1457,99 @@ class BaseOVNChassisCharm(charms_openstack.charm.OpenStackCharm):
             reactive.clear_flag(DOCA_MANAGED_FLAG)
         return something_changed
 
+    def ovs_numa_nodes(self):
+        """NUMA nodes of the ports in ``bridge-interface-mappings``.
+
+        :returns: NUMA nodes, node 0 when none can be told
+        :rtype: List[int]
+        """
+        numa_nodes = set()
+        bim = self.options.bridge_interface_map or {}
+        for br in bim:
+            for port in bim[br]:
+                for ifname, ifdata in bim.get_ifdatamap(br, port).items():
+                    numa_nodes |= interface_numa_nodes(ifname, ifdata)
+        return sorted(numa_nodes) or [0]
+
+    def release_ovs_cpus(self):
+        """Hand the CPUs held for ``ovs-vswitchd`` back to EPA."""
+        for numa_node in host_numa_nodes():
+            epa_client.allocate_numa_cores(EPA_SERVICE_NAME, numa_node, -1)
+        reactive.clear_flag(EPA_CORES_HELD_FLAG)
+
+    def allocate_ovs_cpus(self):
+        """Hold the CPUs ``ovs-vswitchd`` is pinned to with EPA.
+
+        Asking the EPA orchestrator rather than taking a CPU list from the
+        operator keeps ``ovs-vswitchd`` off CPUs other services on the host
+        are pinned to through it.  The CPUs are taken from the NUMA nodes of
+        the physical ports, shared evenly between them when the ports are
+        on more than one.
+
+        :returns: CPU list, or None to not pin ``ovs-vswitchd``
+        :rtype: Optional[str]
+        """
+        if not epa_client.is_available():
+            return None
+        cores = self.options.ovs_cpu_cores
+        if not cores:
+            if reactive.is_flag_set(EPA_CORES_HELD_FLAG):
+                self.release_ovs_cpus()
+            return None
+        ovs_numa_nodes = self.ovs_numa_nodes()
+        # Set up front so that CPUs held by a hook that fails part way are
+        # handed back later.
+        reactive.set_flag(EPA_CORES_HELD_FLAG)
+        cpus = []
+        try:
+            for numa_node in host_numa_nodes():
+                share = 0
+                if numa_node in ovs_numa_nodes:
+                    idx = ovs_numa_nodes.index(numa_node)
+                    share = (cores // len(ovs_numa_nodes) +
+                             (1 if idx < cores % len(ovs_numa_nodes) else 0))
+                cpus.append(epa_client.allocate_numa_cores(
+                    EPA_SERVICE_NAME, numa_node, share or -1))
+        except epa_client.EPAError as e:
+            ch_core.hookenv.log('Not pinning ovs-vswitchd: {}'.format(e),
+                                level=ch_core.hookenv.WARNING)
+            try:
+                self.release_ovs_cpus()
+            except epa_client.EPAError as e:
+                ch_core.hookenv.log('Unable to release CPUs: {}'.format(e),
+                                    level=ch_core.hookenv.WARNING)
+            return None
+        return ','.join(cpu_list for cpu_list in cpus if cpu_list)
+
+    def configure_ovs_cpu_affinity(self):
+        """Pin ``ovs-vswitchd`` to the CPUs EPA holds for it.
+
+        systemd applies ``CPUAffinity`` when it starts the service, so a
+        change only takes effect once ``ovs-vswitchd`` is restarted.
+
+        :returns: Whether something changed
+        :rtype: bool
+        """
+        cpus = self.allocate_ovs_cpus()
+        drop_in = OVS_VSWITCHD_CPU_AFFINITY_DROP_IN
+        if cpus:
+            content = '[Service]\nCPUAffinity={}\n'.format(cpus)
+            try:
+                with open(drop_in) as f:
+                    if f.read() == content:
+                        return False
+            except FileNotFoundError:
+                pass
+            os.makedirs(os.path.dirname(drop_in), exist_ok=True)
+            with open(drop_in, 'w') as f:
+                f.write(content)
+        elif os.path.exists(drop_in):
+            os.remove(drop_in)
+        else:
+            return False
+        self.run('systemctl', 'daemon-reload')
+        return True
+
     def configure_ovs_datapath(self):
         """Configure the datapath type defaults in Open vSwitch.
 
@@ -1494,7 +1664,8 @@ class BaseOVNChassisCharm(charms_openstack.charm.OpenStackCharm):
                          '@manager')
 
         restart_required = (
-            self.configure_ovs_hw_offload() | self.configure_ovs_dpdk())
+            self.configure_ovs_hw_offload() | self.configure_ovs_dpdk() |
+            self.configure_ovs_cpu_affinity())
         if restart_required:
             ch_core.host.service_restart('openvswitch-switch')
 

@@ -15,8 +15,10 @@
 import collections
 import copy
 import io
+import os
 import textwrap
 import subprocess
+import tempfile
 import unittest.mock as mock
 import uuid
 
@@ -522,6 +524,15 @@ class Helper(test_utils.PatchHelper):
             },
             'driver': 'fakedriver',
         }
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.sysfs = tmpdir.name
+        self.cpu_affinity_drop_in = os.path.join(
+            tmpdir.name, 'ovs-vswitchd.service.d', 'charm-cpu-affinity.conf')
+        self.patch_object(ovn_charm, 'OVS_VSWITCHD_CPU_AFFINITY_DROP_IN',
+                          new=self.cpu_affinity_drop_in)
+        self.patch_object(ovn_charm.epa_client, 'is_available',
+                          name='epa_available', return_value=False)
         self.patch_object(ovn_charm.ch_core.hookenv, 'config')
 
         def _fake_config(x=None):
@@ -824,6 +835,7 @@ class TestDPDKOVNChassisCharm(Helper):
             'vpd-device-spec': '',
             'pmd-cpu-set': '',
             'ovn-source': 'distro',
+            'ovs-cpu-cores': 0,
         })
         self.patch_object(ovn_charm.OVNConfigurationAdapter,
                           '_ovs_dpdk_cpu_overlap_check')
@@ -1172,6 +1184,7 @@ class TestOVNChassisCharm(Helper):
             'ovs-exporter-channel': '',
             'enable-version-pinning': False,
             'pmd-cpu-set': None,
+            'ovs-cpu-cores': 0,
         }
         super().setUp(config=self.local_config)
 
@@ -1195,6 +1208,231 @@ class TestOVNChassisCharm(Helper):
         self.patch_datapath_types(['system', 'netdev'])
         self.target.options.pmd_cpu_set = '8-11'
         self.assertIsNone(self.target.pmd_cpu_mask())
+
+    def patch_sysfs(self, numa_nodes=2):
+        """Point the charm at a fake sysfs with ``numa_nodes`` NUMA nodes."""
+        for attr, path in (('SYSFS_NET', 'net'),
+                           ('SYSFS_PCI', 'pci'),
+                           ('SYSFS_NUMA', 'node')):
+            self.patch_object(ovn_charm, attr,
+                              new=os.path.join(self.sysfs, path))
+            os.makedirs(os.path.join(self.sysfs, path))
+        for node in range(numa_nodes):
+            os.makedirs(os.path.join(self.sysfs, 'node', f'node{node}'))
+        # Not a NUMA node.
+        os.makedirs(os.path.join(self.sysfs, 'node', 'power'))
+
+    def add_netdev(self, name, numa_node=None, lower=()):
+        """Add a network device to the fake sysfs.
+
+        :param name: Name of the device.
+        :type name: str
+        :param numa_node: NUMA node of the PCI device behind it, if any.
+        :type numa_node: Optional[int]
+        :param lower: Devices it is stacked on, for example bond members.
+        :type lower: Iterable[str]
+        """
+        netdev = os.path.join(self.sysfs, 'net', name)
+        os.makedirs(netdev)
+        if numa_node is not None:
+            os.makedirs(os.path.join(netdev, 'device'))
+            with open(os.path.join(netdev, 'device', 'numa_node'), 'w') as f:
+                f.write(f'{numa_node}\n')
+        for member in lower:
+            os.symlink(os.path.join(self.sysfs, 'net', member),
+                       os.path.join(netdev, f'lower_{member}'))
+
+    def patch_bridge_interface_map(self, ifdatamap):
+        """Map one port with interfaces ``ifdatamap`` on ``br-data``."""
+        bim = mock.MagicMock()
+        bim.__iter__.return_value = iter(['br-data'])
+        bim.__getitem__.side_effect = lambda br: ['port0']
+        bim.get_ifdatamap.return_value = ifdatamap
+        self.patch_object(ovn_charm.OVNConfigurationAdapter,
+                          'bridge_interface_map', new=bim)
+
+    def test_interface_numa_nodes(self):
+        self.patch_sysfs()
+        self.add_netdev('eth0', numa_node=1)
+        self.assertEqual(ovn_charm.interface_numa_nodes('eth0', {}), {1})
+
+    def test_interface_numa_nodes_bond(self):
+        # A bond has no device of its own, its members do.
+        self.patch_sysfs()
+        self.add_netdev('eth0', numa_node=0)
+        self.add_netdev('eth1', numa_node=1)
+        self.add_netdev('bond0', lower=('eth0', 'eth1'))
+        self.assertEqual(ovn_charm.interface_numa_nodes('bond0', {}), {0, 1})
+
+    def test_interface_numa_nodes_without_numa(self):
+        # The kernel reports -1 for a device not attached to a NUMA node.
+        self.patch_sysfs()
+        self.add_netdev('eth0', numa_node=-1)
+        self.add_netdev('veth0')
+        self.assertEqual(ovn_charm.interface_numa_nodes('eth0', {}), set())
+        self.assertEqual(ovn_charm.interface_numa_nodes('veth0', {}), set())
+        self.assertEqual(ovn_charm.interface_numa_nodes('missing', {}), set())
+
+    def test_interface_numa_nodes_dpdk(self):
+        # A port bound to a DPDK driver has no network device left.
+        self.patch_sysfs()
+        pci = os.path.join(self.sysfs, 'pci', '0000:42:01.0')
+        os.makedirs(pci)
+        with open(os.path.join(pci, 'numa_node'), 'w') as f:
+            f.write('1\n')
+        self.assertEqual(
+            ovn_charm.interface_numa_nodes(
+                'dpdk-a1b2c3d', {'options': {'dpdk-devargs': '0000:42:01.0'}}),
+            {1})
+
+    def test_host_numa_nodes(self):
+        self.patch_sysfs(numa_nodes=2)
+        self.assertEqual(ovn_charm.host_numa_nodes(), [0, 1])
+
+    def test_ovs_numa_nodes(self):
+        self.patch_sysfs()
+        self.add_netdev('eth1', numa_node=1)
+        self.patch_bridge_interface_map({'eth1': {}})
+        self.assertEqual(self.target.ovs_numa_nodes(), [1])
+
+    def test_ovs_numa_nodes_unknown(self):
+        self.patch_sysfs()
+        self.add_netdev('veth0')
+        self.patch_bridge_interface_map({'veth0': {}})
+        self.assertEqual(self.target.ovs_numa_nodes(), [0])
+
+    def patch_epa(self, ovs_cpu_cores, allocate=None):
+        """Configure ``ovs-cpu-cores`` with the EPA orchestrator installed.
+
+        :param ovs_cpu_cores: Value for the ``ovs-cpu-cores`` option.
+        :type ovs_cpu_cores: int
+        :param allocate: CPUs EPA hands out per NUMA node.
+        :type allocate: Optional[Dict[int,str]]
+        """
+        self.local_config.update({'ovs-cpu-cores': ovs_cpu_cores})
+        self.target = ovn_charm.BaseOVNChassisCharm()
+        self.patch_target('run')
+        self.epa_available.return_value = True
+        self.patch_sysfs()
+        allocate = allocate or {}
+
+        def _allocate(service_name, numa_node, num_of_cores):
+            return allocate.get(numa_node, '') if num_of_cores > 0 else ''
+
+        self.patch_object(ovn_charm.epa_client, 'allocate_numa_cores',
+                          side_effect=_allocate)
+        self.patch_object(ovn_charm.reactive, 'set_flag')
+        self.patch_object(ovn_charm.reactive, 'clear_flag')
+
+    def read_drop_in(self):
+        with open(self.cpu_affinity_drop_in) as f:
+            return f.read()
+
+    def test_configure_ovs_cpu_affinity(self):
+        self.patch_epa(8, allocate={1: '136-139,392-395'})
+        self.patch_target('ovs_numa_nodes', return_value=[1])
+        self.assertTrue(self.target.configure_ovs_cpu_affinity())
+        self.allocate_numa_cores.assert_has_calls([
+            mock.call('ovs-vswitchd', 0, -1),
+            mock.call('ovs-vswitchd', 1, 8),
+        ])
+        self.set_flag.assert_called_once_with('charm.ovn.epa-cores-held')
+        self.assertEqual(self.read_drop_in(),
+                         '[Service]\nCPUAffinity=136-139,392-395\n')
+        self.run.assert_called_once_with('systemctl', 'daemon-reload')
+
+    def test_configure_ovs_cpu_affinity_unchanged(self):
+        self.patch_epa(8, allocate={1: '136-139,392-395'})
+        self.patch_target('ovs_numa_nodes', return_value=[1])
+        os.makedirs(os.path.dirname(self.cpu_affinity_drop_in))
+        with open(self.cpu_affinity_drop_in, 'w') as f:
+            f.write('[Service]\nCPUAffinity=136-139,392-395\n')
+        self.assertFalse(self.target.configure_ovs_cpu_affinity())
+        self.run.assert_not_called()
+
+    def test_configure_ovs_cpu_affinity_numa_nodes(self):
+        # Ports on both NUMA nodes share the cores between them.
+        self.patch_epa(8, allocate={0: '8-11', 1: '136-139'})
+        self.patch_target('ovs_numa_nodes', return_value=[0, 1])
+        self.assertTrue(self.target.configure_ovs_cpu_affinity())
+        self.allocate_numa_cores.assert_has_calls([
+            mock.call('ovs-vswitchd', 0, 4),
+            mock.call('ovs-vswitchd', 1, 4),
+        ])
+        self.assertEqual(self.read_drop_in(),
+                         '[Service]\nCPUAffinity=8-11,136-139\n')
+
+    def test_configure_ovs_cpu_affinity_epa_unavailable(self):
+        self.patch_epa(8)
+        self.epa_available.return_value = False
+        os.makedirs(os.path.dirname(self.cpu_affinity_drop_in))
+        with open(self.cpu_affinity_drop_in, 'w') as f:
+            f.write('[Service]\nCPUAffinity=136-139,392-395\n')
+        self.assertTrue(self.target.configure_ovs_cpu_affinity())
+        self.allocate_numa_cores.assert_not_called()
+        self.assertFalse(os.path.exists(self.cpu_affinity_drop_in))
+        self.run.assert_called_once_with('systemctl', 'daemon-reload')
+
+    def test_configure_ovs_cpu_affinity_epa_error(self):
+        # Whatever EPA handed out before failing goes back, as the CPUs
+        # are not used.
+        self.patch_epa(8)
+        self.patch_target('ovs_numa_nodes', return_value=[1])
+        self.patch_object(ovn_charm.ch_core.hookenv, 'log')
+
+        def _allocate(service_name, numa_node, num_of_cores):
+            if num_of_cores > 0:
+                raise ovn_charm.epa_client.EPAError('out of CPUs')
+            return ''
+
+        self.allocate_numa_cores.side_effect = _allocate
+        self.assertFalse(self.target.configure_ovs_cpu_affinity())
+        self.allocate_numa_cores.assert_has_calls([
+            mock.call('ovs-vswitchd', 0, -1),
+            mock.call('ovs-vswitchd', 1, -1),
+        ])
+        self.clear_flag.assert_called_once_with('charm.ovn.epa-cores-held')
+        self.assertFalse(os.path.exists(self.cpu_affinity_drop_in))
+
+    def test_configure_ovs_cpu_affinity_unset_releases(self):
+        self.patch_epa(0)
+        self.patch_object(ovn_charm.reactive, 'is_flag_set',
+                          return_value=True)
+        self.assertFalse(self.target.configure_ovs_cpu_affinity())
+        self.allocate_numa_cores.assert_has_calls([
+            mock.call('ovs-vswitchd', 0, -1),
+            mock.call('ovs-vswitchd', 1, -1),
+        ])
+        self.clear_flag.assert_called_once_with('charm.ovn.epa-cores-held')
+
+    def test_configure_ovs_cpu_affinity_unset_nothing_held(self):
+        self.patch_epa(0)
+        self.patch_object(ovn_charm.reactive, 'is_flag_set',
+                          return_value=False)
+        self.assertFalse(self.target.configure_ovs_cpu_affinity())
+        self.allocate_numa_cores.assert_not_called()
+
+    def test_configure_ovs_restarts_on_cpu_affinity_change(self):
+        self.patch_target('configure_ovs_cpu_affinity', return_value=True)
+        self.patch_target('run')
+        self.patch_target('check_if_paused', return_value=(None, None))
+        self.patch_target('get_data_ip')
+        self.patch_target('get_ovs_hostname')
+        self.patch_object(ovn_charm.OVNConfigurationAdapter, 'ovn_key')
+        self.patch_object(ovn_charm.OVNConfigurationAdapter, 'ovn_cert')
+        self.patch_object(ovn_charm.OVNConfigurationAdapter, 'ovn_ca_cert')
+        self.patch_object(ovn_charm.ch_core.host, 'service_restart')
+        self.target.configure_ovs('fake-sb-conn-str', False)
+        self.service_restart.assert_called_once_with('openvswitch-switch')
+
+    def test_custom_assess_status_last_check_not_pinned(self):
+        # Pinning is best effort, so the unit keeps working, but says so.
+        self.local_config.update({'ovs-cpu-cores': 8})
+        self.target = ovn_charm.BaseOVNChassisCharm()
+        self.assertEqual(
+            self.target.custom_assess_status_last_check(),
+            ('active', 'ovs-vswitchd is not pinned to the 8 CPUs in '
+                       'ovs-cpu-cores, see the unit log.'))
 
     def test_configure_ovs_doca_not_ours(self):
         # The offload provider of a host that had OVS-DOCA before the charm
@@ -2093,6 +2331,7 @@ class TestDOCAOVNChassisCharm(Helper):
             'vpd-device-spec': '',
             'ovn-source': 'distro',
             'pmd-cpu-set': None,
+            'ovs-cpu-cores': 0,
         })
 
     def test_packages(self):
